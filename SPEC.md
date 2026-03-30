@@ -1,6 +1,6 @@
 # Light Trend — Specification
 
-> Version: 2.0 (macOS Native)
+> Version: 2.1 (macOS Native)
 > Date: 2026-03-30
 > Status: Implemented
 
@@ -8,22 +8,22 @@
 
 ## 1. Overview
 
-A macOS menu bar app that aggregates trending topics from 8 platforms into a unified, ranked feed with cross-platform clustering. Click the tray icon to open, click again to hide. Native HudWindow vibrancy, zero API keys required (YouTube optional).
+A macOS menu bar app that aggregates trending topics from 8 platforms into a unified, ranked feed with cross-platform clustering and content enrichment. Click the tray icon to open, click again to hide. Native HudWindow vibrancy, designed for content creators who need to know what the world is talking about.
 
 ## 2. Goals
 
-- **Multi-source trending**: Surface what's trending across Reddit, HN, GitHub, Google Trends, YouTube, Wikipedia, News, and Product Hunt
-- **Zero friction**: Menu bar icon, one click to open/hide
+- **Content-rich trending**: Not just titles — context, summaries, related news for every topic
 - **Cross-platform intelligence**: Cluster same topics from different platforms, composite scoring
+- **Detective enrichment**: Use data from one platform to fill gaps in another
+- **Zero friction**: Menu bar icon, one click to open/hide
 - **Lightweight**: Native macOS app via Tauri v2
-- **Offline-first**: Cached data loads instantly, refresh on demand
 
 ## 3. Non-Goals
 
 - No push notifications
 - No user accounts or authentication
 - No cross-platform support (macOS only)
-- No Anthropic API key required
+- No developer-focused platforms (removed GitHub, Product Hunt)
 
 ---
 
@@ -36,7 +36,8 @@ A macOS menu bar app that aggregates trending topics from 8 platforms into a uni
 | Desktop framework | Tauri v2 | Native macOS window, tray icon, vibrancy |
 | Frontend | React 19 + TypeScript | Component model, fast dev |
 | Styling | Tailwind CSS v4 | Utility-first |
-| Backend (Rust) | reqwest + futures | Parallel HTTP fetching for all 8 platforms |
+| Backend (Rust) | reqwest + futures + tokio | Parallel HTTP fetching for all 8 platforms |
+| Env loading | dotenvy | Loads .env for API keys |
 | Window effects | window-vibrancy | Native macOS HudWindow material |
 | Build tool | Vite 7 | Fast HMR, Tauri-compatible |
 
@@ -55,75 +56,80 @@ A macOS menu bar app that aggregates trending topics from 8 platforms into a uni
 │  │  React   │◄────────────►│    Rust Core     │  │
 │  │  WebView │  (commands)  │                  │  │
 │  │          │              │  platforms.rs    │  │
-│  │  App.tsx │              │  lib.rs (tray)   │  │
+│  │  App.tsx │              │  (8 fetchers +   │  │
+│  │          │              │   enrichment)    │  │
 │  └──────────┘              └───────┬──────────┘  │
 │       │                            │              │
-│   localStorage                     │              │
-│   (cache)                          │              │
+│   localStorage                  .env file         │
+│   (cache)                    (API keys)           │
 └────────────────────────────────────┼──────────────┘
                      ┌───────────────┼───────────────┐
                      ▼               ▼               ▼
-              reddit.com      github.com       7 more APIs
-              (JSON API)     (Search API)    (parallel fetch)
+              reddit.com      youtube.com       6 more APIs
+              (JSON API)     (Data API v3)    (parallel fetch)
 ```
 
 ---
 
 ## 5. Data Pipeline
 
-### 5.1 Platform Fetching
+### 5.1 Platform Sources (8 total)
 
-All 8 platforms fetched **in parallel** via `tokio::join!` in Rust. Each has an 8-second timeout. Individual failures don't block the aggregate.
+All platforms fetched **in parallel** via `tokio::join!`. Each has an 8-second timeout.
 
-| Platform | API | Auth | Items | Parallelism |
-|----------|-----|------|-------|-------------|
-| Reddit | Public JSON | None | ~150 | 4-batch subreddits |
-| Hacker News | Firebase | None | 30 | 15-batch items |
-| GitHub | Search API | None | 20 | Single request |
-| Google Trends | RSS feed | None | ~45 | 5 geos parallel |
-| YouTube | Data API v3 | Optional key | ~24 | 2 regions parallel |
-| Wikipedia | Wikimedia | None | 30 | Single request |
-| News | RSS feeds | None | ~60 | 7 feeds parallel |
-| Product Hunt | GraphQL | None | 15 | Single request |
+| Platform | API | Auth | Weight | Content Quality |
+|----------|-----|------|--------|----------------|
+| YouTube | Data API v3 | API key (env) | **1.4** | Title + description + views |
+| Google Trends | RSS feed | None | **1.2** | Topic + related news article titles (enriched) |
+| Reddit | Public JSON | None | **1.2** | Title + selftext + upvotes |
+| Hacker News | Firebase | None | 0.9 | Title + post text (enriched) |
+| Wikipedia | Wikimedia | None | **0.9** | Title + page summary (enriched via API) |
+| Mastodon | Public API | None | 0.6 | Smart sentence-split title + full post |
+| Bluesky | AT Protocol | None | 0.6 | Smart sentence-split title + full post |
+| News RSS | RSS feeds | None | 0.3 | Title + description (validation only) |
 
-**Subreddits**: popular, all, technology, worldnews, science, movies, gaming, music, television, entertainment
+**Removed platforms**: GitHub (dev niche), Product Hunt (startup niche), Spotify (needs paid credentials)
 
-**News RSS**: NYTimes, BBC, Guardian, Ars Technica, Variety, IGN, BBC Entertainment
+### 5.2 Content Enrichment Engine
 
-**Google Trends geos**: US, GB, AU, CA, IN
+The "detective" approach — use already-fetched data to fill content gaps:
 
-### 5.2 Normalization
+1. **Google Trends**: RSS contains `<ht:news_item>` blocks with linked news article titles. Parsed and concatenated as description: `"Related: 'Article title 1' | 'Article title 2'"`
 
-Per-platform scores normalized to 0–100, then multiplied by platform weight (capped at 100):
+2. **Wikipedia**: After fetching top 30 articles, parallel batch requests (3 × 10) to `en.wikipedia.org/api/rest_v1/page/summary/{title}` for 1-2 sentence plain-text summaries.
 
-| Platform | Weight |
-|----------|--------|
-| Google Trends | 1.4 |
-| YouTube | 1.3 |
-| Reddit | 1.2 |
-| Hacker News | 0.9 |
-| Wikipedia | 0.8 |
-| News | 0.7 |
-| GitHub | 0.7 |
-| Product Hunt | 0.6 |
+3. **Mastodon / Bluesky**: Smart sentence-boundary splitting instead of hard 100-char cut. Finds first `.!?\n` within 120 chars for title, full text for description.
 
-### 5.3 Cross-Platform Clustering
+4. **Hacker News**: Extracts `text` field from post JSON (for Ask HN, Show HN posts).
 
-Topics from different platforms about the same subject are merged using:
-1. **Keyword overlap** (Set-based): 3+ matching keywords → merge
-2. **Trigram similarity** (Dice coefficient): 2+ keywords AND similarity > 0.25 → merge
+5. **Cross-platform backfill**: After clustering, any topic still missing a description gets keyword-matched against ALL fetched items. If another item shares 2+ keywords and has a description ≥20 chars, that description is borrowed.
 
-Same platform can only appear once per cluster.
+### 5.3 Scoring Algorithm
 
-### 5.4 Composite Scoring
-
+#### Step 1: Normalize (per-platform, 0-100)
 ```
-compositeScore = normalizedScore + (mentions - 1) × 20 + recencyBonus
+normalizedScore = (item.score / platform_max_score) × 100 × platform_weight
+```
+Capped at 100. Platforms without real engagement metrics (News) use position-based scoring.
+
+#### Step 2: Cluster (cross-platform)
+- Keyword overlap: 3+ matching keywords → merge
+- Trigram similarity (Dice coefficient): 2+ keywords AND similarity > 0.25 → merge
+- Same platform can only appear once per cluster
+
+#### Step 3: Composite Score
+```
+compositeScore = normalizedScore
+               + (mentions - 1) × 20        // cross-platform bonus
+               + recencyBonus               // +15/+10/+5/+0
+               + richnessModifier           // 0/-5/-10
 ```
 
-Recency bonus: +15 (<1h), +10 (<6h), +5 (<12h), 0 (older)
+- **Cross-platform bonus**: +20 per additional platform
+- **Recency**: +15 (<1h), +10 (<6h), +5 (<12h)
+- **Content richness penalty**: description ≥50 chars → 0, <50 chars → -5, none → -10
 
-### 5.5 Categorization
+### 5.4 Categorization
 
 8 categories via shared keyword dictionary:
 All, Technology, Entertainment, Politics, Business, Science, Sports, General
@@ -132,20 +138,25 @@ All, Technology, Entertainment, Politics, Business, Science, Sports, General
 
 ## 6. IPC Commands
 
-| Command | Parameters | Returns | Description |
-|---------|-----------|---------|-------------|
-| `fetch_trending` | `youtubeKey?: string` | `TrendingData` | Fetch all platforms, normalize, cluster, rank |
+| Command | Parameters | Returns |
+|---------|-----------|---------|
+| `fetch_trending` | `youtubeKey?: string` | `TrendingData` |
 
-### TrendingData Schema (camelCase via serde)
+YouTube API key resolution order:
+1. Frontend parameter (from localStorage)
+2. Environment variable `YOUTUBE_API_KEY`
+3. `.env` file (loaded via dotenvy at startup)
+
+### Data Schema (camelCase via serde)
 
 ```typescript
 interface TrendingData {
-  items: ClusteredItem[];           // Top 50 clustered topics
+  items: ClusteredItem[];
   byCategory: Record<string, ClusteredItem[]>;
   platformStats: Record<string, { count: number; name: string }>;
   totalItems: number;
-  fetchedAt: string;                // ISO-8601
-  elapsed: number;                  // ms
+  fetchedAt: string;
+  elapsed: number;
 }
 
 interface ClusteredItem {
@@ -170,17 +181,7 @@ interface ClusteredItem {
 
 ## 7. UI Specification
 
-### 7.1 Design Principles
-
-- Native macOS HudWindow vibrancy (frosted glass)
-- Semi-transparent dark overlay `rgba(14,16,23,0.82)` for structure
-- System font (-apple-system / SF Pro)
-- 15px titles, 13px body text (macOS standard)
-- Single accent color: blue-500
-- Score colors: rose (>80), blue (>50), muted (below)
-- Colored platform tags with per-platform identity
-
-### 7.2 Window Properties
+### 7.1 Window Properties
 
 | Property | Value |
 |----------|-------|
@@ -192,62 +193,36 @@ interface ClusteredItem {
 | Decorations | None (custom drag region) |
 | Transparent | Yes (native vibrancy) |
 | Dock icon | None (Accessory policy) |
-| Corner radius | 16px (via vibrancy) |
+
+### 7.2 Design
+
+- Semi-transparent dark overlay on native HudWindow vibrancy
+- System font (-apple-system / SF Pro)
+- 15px titles (2-line wrap), 13px descriptions
+- Score colors: rose (>80), blue (>50), muted (below)
+- Colored platform tags per platform identity
+- Top 3 items have amber left border accent
 
 ### 7.3 Layout
 
-```
-┌─────────────────────────────────────────────┐
-│  Light Trend                    14:32  [Rfr] │ ← drag region
-│─────────────────────────────────────────────│
-│  All(30)  Tech(20)  Ent(20)  Pol(18)  ...    │ ← filter pills
-│─────────────────────────────────────────────│
-│  Filter topics…  /                           │ ← search
-│─────────────────────────────────────────────│
-│  1  Topic title that can wrap to            │
-│     two lines if needed                      │
-│     Description text in muted color…    85   │
-│     [reddit] [hackernews] · 3 sources · 2h   │
-│                                              │
-│  2  Another trending topic across            │
-│     multiple platforms                       │
-│     Brief description here…              72   │
-│     [google] [news] · 2 sources · 5h        │
-│                                              │
-│  ...                                         │
-│─────────────────────────────────────────────│
-│  7 sources          371 items          2.1s  │ ← status bar
-└─────────────────────────────────────────────┘
-```
+Header (drag region) → Filter pills → Search → Topic list → Status bar
 
-### 7.4 States
+### 7.4 Expanded Detail
 
-| State | Display |
-|-------|---------|
-| Cached data | Instant display from localStorage |
-| Loading (no cache) | Spinner + "Scanning networks…" |
-| Error (no data) | Error message + Retry button |
-| Refreshing (has data) | Button shows ↻, existing data stays |
-| Empty category | "No topics in this category" |
-| Empty search | "No match for …" |
-
-### 7.5 Expanded Detail Panel
-
-Clicking a topic expands inline:
-- Platform distribution bars (colored per platform)
-- Geo region tags (if available)
-- Full description text
-- Source links (per platform)
+- Platform distribution bars (colored)
+- Geo region tags
+- Full description
+- Source links per platform
 
 ---
 
-## 8. Caching
+## 8. Environment
 
-- **Key**: `lt_cache` in localStorage
-- **Contents**: Full `TrendingData` JSON
-- **Behavior**: Load from cache instantly on open, fetch fresh in background
-- **Corruption**: Invalid JSON is detected and evicted
-- **YouTube API key**: Stored in `youtube_api_key` localStorage key
+| Variable | Required | Source |
+|----------|----------|-------|
+| `YOUTUBE_API_KEY` | Optional | `.env` file or environment variable |
+
+YouTube quota: 10,000 units/day (free). Each refresh = 2 units. Monitor at [Google Cloud Console](https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas).
 
 ---
 
@@ -256,66 +231,45 @@ Clicking a topic expands inline:
 ```
 light-trend-app/
 ├── SPEC.md
+├── .env                   # YouTube API key (gitignored)
 ├── package.json
 ├── vite.config.ts
 ├── tsconfig.json
-├── tsconfig.node.json
 ├── index.html
 ├── src/
-│   ├── main.tsx              # React entry
-│   ├── App.tsx               # Main app (filter, search, card list)
-│   ├── types.ts              # TypeScript interfaces
-│   └── index.css             # Global styles
+│   ├── main.tsx
+│   ├── App.tsx            # Main app (filter, search, cards)
+│   ├── types.ts           # TypeScript interfaces
+│   └── index.css          # Global styles
 └── src-tauri/
-    ├── Cargo.toml            # Rust dependencies
-    ├── tauri.conf.json       # Window config, tray, permissions
-    ├── capabilities/
-    │   └── default.json      # Tauri v2 permissions
+    ├── Cargo.toml
+    ├── tauri.conf.json
+    ├── capabilities/default.json
     ├── icons/
-    │   ├── tray-icon.png     # Menu bar icon (template)
-    │   ├── icon.png          # App icon 1024px
-    │   ├── icon.icns         # macOS app icon
-    │   └── ...               # Various sizes
     └── src/
-        ├── main.rs           # Binary entry point
-        ├── lib.rs            # Tauri setup, tray, vibrancy
-        └── platforms.rs      # All 8 platform fetchers + clustering
+        ├── main.rs
+        ├── lib.rs          # Tauri setup, tray, vibrancy, dotenv
+        └── platforms.rs    # 8 fetchers + enrichment + clustering
 ```
 
 ---
 
-## 10. Environment
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `YOUTUBE_API_KEY` | No | Set in localStorage via browser console. If absent, YouTube skipped. |
-
----
-
-## 11. Running
+## 10. Running
 
 ```bash
-# Development (hot reload)
+# Development
 npm run tauri dev
 
-# Build for production
+# Production build
 npm run tauri build
 ```
 
 ---
 
-## 12. Evolution from v1
+## 11. Version History
 
-Light Trend v1 was a Node.js web server at localhost:3000. v2 migrates to:
-
-| v1 (Web) | v2 (Tauri) |
-|----------|-----------|
-| Node.js HTTP server | Rust native backend |
-| Browser at localhost | macOS menu bar tray icon |
-| CSS glassmorphism | Native HudWindow vibrancy |
-| JS fetch API | reqwest + tokio parallel |
-| In-memory cache (TTL) | localStorage persistent |
-| Inline HTML/CSS/JS | React + TypeScript + Tailwind |
-| Platform logic in JS | Platform logic in Rust |
-
-The web version is preserved at `/Users/meco/light-trend/` and on GitHub as the `light-trend` repo.
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0 | 2026-03-30 | Web version (Node.js server at localhost:3000) |
+| 2.0 | 2026-03-30 | Tauri v2 macOS native, 11 platforms |
+| 2.1 | 2026-03-30 | Content enrichment engine, removed GitHub/PH/Spotify, 8 platforms, detective cross-fill, richness penalty |
