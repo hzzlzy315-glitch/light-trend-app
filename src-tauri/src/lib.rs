@@ -6,10 +6,18 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::Manager;
 
 #[tauri::command]
-async fn fetch_trending(youtube_key: Option<String>) -> Result<TrendingData, String> {
-    platforms::fetch_all(youtube_key.as_deref())
-        .await
-        .map_err(|e| format!("{e:#}"))
+async fn fetch_trending(
+    youtube_key: Option<String>,
+    spotify_id: Option<String>,
+    spotify_secret: Option<String>,
+) -> Result<TrendingData, String> {
+    platforms::fetch_all(
+        youtube_key.as_deref(),
+        spotify_id.as_deref(),
+        spotify_secret.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))
 }
 
 fn toggle_window(window: &tauri::WebviewWindow) {

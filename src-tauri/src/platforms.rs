@@ -107,16 +107,23 @@ fn platform_weight(platform: &str) -> f64 {
         "reddit" => 1.2,
         "hackernews" => 0.9,
         "wikipedia" => 0.8,
-        "news" => 0.7,
+        "news" => 0.3,   // validation-only: boosts cross-platform topics, not a standalone signal
         "github" => 0.7,
         "producthunt" => 0.6,
+        "mastodon" => 0.7,
+        "bluesky" => 0.7,
+        "spotify" => 0.8,
         _ => 1.0,
     }
 }
 
 // ─── Main fetch ──────────────────────────────────────────────
 
-pub async fn fetch_all(youtube_key: Option<&str>) -> Result<TrendingData> {
+pub async fn fetch_all(
+    youtube_key: Option<&str>,
+    spotify_id: Option<&str>,
+    spotify_secret: Option<&str>,
+) -> Result<TrendingData> {
     let start = Instant::now();
     let client = Client::builder()
         .timeout(FETCH_TIMEOUT)
@@ -124,7 +131,7 @@ pub async fn fetch_all(youtube_key: Option<&str>) -> Result<TrendingData> {
         .build()?;
 
     // Fetch all platforms in parallel
-    let (reddit, hn, github, google, youtube, wikipedia, news, ph) = tokio::join!(
+    let (reddit, hn, github, google, youtube, wikipedia, news, ph, mastodon, bluesky, spotify) = tokio::join!(
         fetch_reddit(&client),
         fetch_hackernews(&client),
         fetch_github(&client),
@@ -133,10 +140,13 @@ pub async fn fetch_all(youtube_key: Option<&str>) -> Result<TrendingData> {
         fetch_wikipedia(&client),
         fetch_news(&client),
         fetch_producthunt(&client),
+        fetch_mastodon(&client),
+        fetch_bluesky(&client),
+        fetch_spotify(&client, spotify_id, spotify_secret),
     );
 
     let mut all_items: Vec<TrendItem> = Vec::new();
-    for result in [reddit, hn, github, google, youtube, wikipedia, news, ph] {
+    for result in [reddit, hn, github, google, youtube, wikipedia, news, ph, mastodon, bluesky, spotify] {
         match result {
             Ok(items) => all_items.extend(items),
             Err(e) => eprintln!("[Platform error] {e:#}"),
@@ -728,7 +738,7 @@ async fn fetch_news(client: &Client) -> Result<Vec<TrendItem>> {
                     title,
                     description: desc.map(|d| d.chars().take(200).collect()),
                     url: if link.is_empty() { return None } else { link },
-                    score: (50 - idx as i64 * 5).max(0),
+                    score: (20 - idx as i64 * 2).max(0),
                     platform: "news".to_string(),
                     category: category.clone(),
                     timestamp: pub_date.and_then(|d| {
@@ -782,5 +792,228 @@ async fn fetch_producthunt(client: &Client) -> Result<Vec<TrendItem>> {
             }).collect()
         })
         .unwrap_or_default();
+    Ok(items)
+}
+
+// --- Bluesky ---
+
+async fn fetch_bluesky(client: &Client) -> Result<Vec<TrendItem>> {
+    let url = "https://public.api.bsky.app/xrpc/app.bsky.feed.getFeed?feed=at://did:plc:z72i7hdynmk6r22z27h6tvur/app.bsky.feed.generator/whats-hot&limit=30";
+    let res = client.get(url).send().await?;
+    if !res.status().is_success() { return Ok(Vec::new()); }
+    let data: serde_json::Value = res.json().await?;
+
+    let feed = match data["feed"].as_array() {
+        Some(f) => f,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut items = Vec::new();
+    for entry in feed {
+        let post = &entry["post"];
+        let text = post["record"]["text"].as_str().unwrap_or_default();
+        if text.is_empty() { continue; }
+
+        let uri = post["uri"].as_str().unwrap_or_default();
+        // URI format: at://did:plc:xxx/app.bsky.feed.post/rkey
+        let (did, rkey) = match parse_at_uri(uri) {
+            Some(pair) => pair,
+            None => continue,
+        };
+
+        let like_count = post["likeCount"].as_i64().unwrap_or(0);
+        let repost_count = post["repostCount"].as_i64().unwrap_or(0);
+        let score = like_count + repost_count;
+
+        let title: String = text.chars().take(100).collect();
+        let description: String = text.chars().take(200).collect();
+        let bsky_url = format!("https://bsky.app/profile/{did}/post/{rkey}");
+        let indexed_at = post["indexedAt"].as_str().map(|s| s.to_string());
+
+        items.push(TrendItem {
+            id: format!("bsky_{rkey}"),
+            title,
+            description: Some(description),
+            url: bsky_url,
+            score,
+            platform: "bluesky".to_string(),
+            category: categorize_by_title(text).to_string(),
+            timestamp: indexed_at,
+            geos: None,
+        });
+    }
+
+    // Deduplicate by ID
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert(item.id.clone()));
+    Ok(items)
+}
+
+fn parse_at_uri(uri: &str) -> Option<(String, String)> {
+    // at://did:plc:xxx/app.bsky.feed.post/rkey
+    let stripped = uri.strip_prefix("at://")?;
+    let parts: Vec<&str> = stripped.splitn(3, '/').collect();
+    if parts.len() < 3 { return None; }
+    let did = parts[0].to_string();
+    let rkey = parts[2].to_string();
+    Some((did, rkey))
+}
+
+// --- Spotify ---
+
+async fn fetch_spotify(
+    client: &Client,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+) -> Result<Vec<TrendItem>> {
+    let (id, secret) = match (client_id, client_secret) {
+        (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => (id, secret),
+        _ => return Ok(Vec::new()),
+    };
+
+    // Step 1: Get access token via Client Credentials flow
+    let token_res = client
+        .post("https://accounts.spotify.com/api/token")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "grant_type=client_credentials&client_id={id}&client_secret={secret}"
+        ))
+        .send()
+        .await?;
+
+    if !token_res.status().is_success() {
+        return Ok(Vec::new());
+    }
+
+    let token_data: serde_json::Value = token_res.json().await?;
+    let access_token = match token_data["access_token"].as_str() {
+        Some(t) => t.to_string(),
+        None => return Ok(Vec::new()),
+    };
+
+    // Step 2: Fetch "Today's Top Hits" playlist tracks
+    let playlist_res = client
+        .get("https://api.spotify.com/v1/playlists/37i9dQZF1DXcBWIGoYBM5M/tracks?limit=20")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .send()
+        .await?;
+
+    if !playlist_res.status().is_success() {
+        return Ok(Vec::new());
+    }
+
+    let playlist_data: serde_json::Value = playlist_res.json().await?;
+
+    let items = playlist_data["items"]
+        .as_array()
+        .map(|tracks| {
+            tracks
+                .iter()
+                .filter_map(|entry| {
+                    let track = &entry["track"];
+                    let track_id = track["id"].as_str().unwrap_or("");
+                    let name = track["name"].as_str().unwrap_or("");
+                    if track_id.is_empty() || name.is_empty() {
+                        return None;
+                    }
+
+                    let artists: Vec<&str> = track["artists"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|a| a["name"].as_str())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let artist_str = artists.join(", ");
+
+                    let album = track["album"]["name"].as_str().unwrap_or("");
+                    let popularity = track["popularity"].as_i64().unwrap_or(0);
+                    let url = track["external_urls"]["spotify"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+
+                    Some(TrendItem {
+                        id: format!("spotify_{track_id}"),
+                        title: format!("{name} \u{2014} {artist_str}"),
+                        description: if album.is_empty() {
+                            None
+                        } else {
+                            Some(format!("from album: {album}"))
+                        },
+                        url: if url.is_empty() {
+                            format!("https://open.spotify.com/track/{track_id}")
+                        } else {
+                            url
+                        },
+                        score: popularity,
+                        platform: "spotify".to_string(),
+                        category: "entertainment".to_string(),
+                        timestamp: None,
+                        geos: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(items)
+}
+
+// --- Mastodon ---
+
+#[derive(Debug, Deserialize)]
+struct MastodonStatus {
+    id: String,
+    content: String,
+    url: String,
+    reblogs_count: i64,
+    favourites_count: i64,
+    created_at: String,
+}
+
+async fn fetch_mastodon(client: &Client) -> Result<Vec<TrendItem>> {
+    let res = client
+        .get("https://mastodon.social/api/v1/trends/statuses?limit=20")
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        return Ok(Vec::new());
+    }
+
+    let statuses: Vec<MastodonStatus> = res.json().await?;
+
+    let items = statuses
+        .into_iter()
+        .map(|status| {
+            let plain = strip_html(&status.content);
+            let title: String = plain.chars().take(100).collect();
+            let description = if plain.len() > 100 {
+                Some(plain.chars().take(300).collect::<String>())
+            } else {
+                None
+            };
+            let score = status.reblogs_count + status.favourites_count;
+            let category = categorize_by_title(&title).to_string();
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&status.created_at)
+                .ok()
+                .map(|dt| dt.to_rfc3339());
+
+            TrendItem {
+                id: format!("masto_{}", status.id),
+                title,
+                description,
+                url: status.url,
+                score,
+                platform: "mastodon".to_string(),
+                category,
+                timestamp,
+                geos: None,
+            }
+        })
+        .collect();
+
     Ok(items)
 }
