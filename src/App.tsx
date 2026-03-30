@@ -68,6 +68,10 @@ export default function App() {
     const c = localStorage.getItem("lt_cache");
     if (c) { try { setData(JSON.parse(c)); setLoading(false); } catch { localStorage.removeItem("lt_cache"); } }
     fetch_();
+
+    // Auto-refresh every 1 hour
+    const interval = setInterval(fetch_, 60 * 60 * 1000);
+    return () => clearInterval(interval);
   }, [fetch_]);
 
   useEffect(() => {
