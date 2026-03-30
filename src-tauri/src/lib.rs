@@ -1,6 +1,7 @@
 mod platforms;
 
 use platforms::TrendingData;
+
 use tauri::image::Image;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
@@ -31,6 +32,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![fetch_trending])
         .setup(|app| {
+            // Load .env for API keys
+            let _ = dotenvy::dotenv();
+
             // Set activation policy early — before tray/window setup
             #[cfg(target_os = "macos")]
             {

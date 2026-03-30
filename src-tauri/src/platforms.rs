@@ -682,9 +682,14 @@ fn parse_traffic(s: &str) -> i64 {
 // --- YouTube ---
 
 async fn fetch_youtube(client: &Client, api_key: Option<&str>) -> Result<Vec<TrendItem>> {
+    // Try parameter first, then environment variable
+    let env_key = std::env::var("YOUTUBE_API_KEY").ok();
     let key = match api_key {
-        Some(k) if !k.is_empty() => k,
-        _ => return Ok(Vec::new()),
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => match env_key {
+            Some(ref k) if !k.is_empty() => k.clone(),
+            _ => return Ok(Vec::new()),
+        },
     };
 
     let regions = ["US", "GB"];
