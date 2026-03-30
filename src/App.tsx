@@ -10,7 +10,7 @@ const CAT_LABELS: Record<string, string> = {
 const PC: Record<string, string> = {
   reddit:"#ff4500", hackernews:"#ff6600", github:"#8b949e", google:"#4285f4",
   youtube:"#ff0000", wikipedia:"#a1a1aa", news:"#f59e0b", producthunt:"#da552f",
-  mastodon:"#6364ff", bluesky:"#0085ff", spotify:"#1db954"
+  mastodon:"#6364ff", bluesky:"#0085ff"
 };
 
 function timeAgo(ts: string | null): string {
@@ -44,9 +44,7 @@ export default function App() {
     try {
       setError(null);
       const youtubeKey = localStorage.getItem("youtube_api_key") || undefined;
-      const spotifyId = localStorage.getItem("spotify_client_id") || undefined;
-      const spotifySecret = localStorage.getItem("spotify_client_secret") || undefined;
-      const r = await invoke<TrendingData>("fetch_trending", { youtubeKey, spotifyId, spotifySecret });
+      const r = await invoke<TrendingData>("fetch_trending", { youtubeKey });
       setData(r);
       localStorage.setItem("lt_cache", JSON.stringify(r));
     } catch (e) { setError(String(e)); }

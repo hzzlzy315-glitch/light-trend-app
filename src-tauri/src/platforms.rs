@@ -102,17 +102,14 @@ fn categorize_by_title(title: &str) -> &'static str {
 
 fn platform_weight(platform: &str) -> f64 {
     match platform {
-        "google" => 1.4,
-        "youtube" => 1.3,
-        "reddit" => 1.2,
+        "youtube" => 1.4,     // highest — real view counts
+        "google" => 1.2,      // search interest
+        "reddit" => 1.2,      // real upvotes
         "hackernews" => 0.9,
-        "wikipedia" => 0.8,
-        "news" => 0.3,   // validation-only: boosts cross-platform topics, not a standalone signal
-        "github" => 0.7,
-        "producthunt" => 0.6,
-        "mastodon" => 0.7,
-        "bluesky" => 0.7,
-        "spotify" => 0.8,
+        "wikipedia" => 0.9,   // bumped — will have summaries
+        "mastodon" => 0.6,    // social noise
+        "bluesky" => 0.6,     // social noise
+        "news" => 0.3,        // validation only
         _ => 1.0,
     }
 }
@@ -121,8 +118,6 @@ fn platform_weight(platform: &str) -> f64 {
 
 pub async fn fetch_all(
     youtube_key: Option<&str>,
-    spotify_id: Option<&str>,
-    spotify_secret: Option<&str>,
 ) -> Result<TrendingData> {
     let start = Instant::now();
     let client = Client::builder()
@@ -131,22 +126,19 @@ pub async fn fetch_all(
         .build()?;
 
     // Fetch all platforms in parallel
-    let (reddit, hn, github, google, youtube, wikipedia, news, ph, mastodon, bluesky, spotify) = tokio::join!(
+    let (reddit, hn, google, youtube, wikipedia, news, mastodon, bluesky) = tokio::join!(
         fetch_reddit(&client),
         fetch_hackernews(&client),
-        fetch_github(&client),
         fetch_google(&client),
         fetch_youtube(&client, youtube_key),
         fetch_wikipedia(&client),
         fetch_news(&client),
-        fetch_producthunt(&client),
         fetch_mastodon(&client),
         fetch_bluesky(&client),
-        fetch_spotify(&client, spotify_id, spotify_secret),
     );
 
     let mut all_items: Vec<TrendItem> = Vec::new();
-    for result in [reddit, hn, github, google, youtube, wikipedia, news, ph, mastodon, bluesky, spotify] {
+    for result in [reddit, hn, google, youtube, wikipedia, news, mastodon, bluesky] {
         match result {
             Ok(items) => all_items.extend(items),
             Err(e) => eprintln!("[Platform error] {e:#}"),
@@ -157,6 +149,30 @@ pub async fn fetch_all(
     let normalized = normalize_scores(&all_items);
     let mut clustered = cluster_topics(&normalized);
     clustered.sort_by(|a, b| b.composite_score.cmp(&a.composite_score));
+
+    // After clustering, enrich empty descriptions from other items
+    for cluster in &mut clustered {
+        if cluster.description.is_some() { continue; }
+        let kw = extract_keywords(&cluster.title);
+        if kw.is_empty() { continue; }
+
+        let mut best: Option<&str> = None;
+        let mut best_overlap = 0;
+        for item in &all_items {
+            if let Some(ref desc) = item.description {
+                if desc.len() < 20 { continue; }
+                let item_kw = extract_keywords(&item.title);
+                let overlap = kw.iter().filter(|k| item_kw.contains(*k)).count();
+                if overlap >= 2 && overlap > best_overlap {
+                    best_overlap = overlap;
+                    best = Some(desc);
+                }
+            }
+        }
+        if let Some(desc) = best {
+            cluster.description = Some(desc.to_string());
+        }
+    }
 
     // Build category views
     let mut by_category: HashMap<String, Vec<ClusteredItem>> = HashMap::new();
@@ -340,6 +356,14 @@ fn cluster_topics(items: &[NormalizedItem]) -> Vec<ClusteredItem> {
             + (cluster.mentions as i64 - 1) * 20
             + recency_bonus(&cluster.timestamp);
 
+        // Content richness penalty
+        let richness = match &cluster.description {
+            Some(d) if d.len() >= 50 => 0,
+            Some(_) => -5,
+            None => -10,
+        };
+        cluster.composite_score += richness;
+
         used.insert(i);
         clusters.push(cluster);
     }
@@ -381,7 +405,23 @@ fn strip_html(s: &str) -> String {
         else if !in_tag { result.push(c); }
     }
     // Decode common entities
-    result.replace("&amp;", "&")
+    result
+        .replace("&#8217;", "\u{2019}")  // right single quote '
+        .replace("&#8216;", "\u{2018}")  // left single quote '
+        .replace("&#8220;", "\u{201C}")  // left double quote "
+        .replace("&#8221;", "\u{201D}")  // right double quote "
+        .replace("&#8212;", "\u{2014}")  // em dash —
+        .replace("&#8211;", "\u{2013}")  // en dash –
+        .replace("&#160;", " ")          // non-breaking space
+        .replace("&mdash;", "\u{2014}")
+        .replace("&ndash;", "\u{2013}")
+        .replace("&rsquo;", "\u{2019}")
+        .replace("&lsquo;", "\u{2018}")
+        .replace("&rdquo;", "\u{201D}")
+        .replace("&ldquo;", "\u{201C}")
+        .replace("&nbsp;", " ")
+        .replace("&hellip;", "\u{2026}")
+        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -389,6 +429,37 @@ fn strip_html(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// ─── Smart sentence splitting ────────────────────────────────
+
+fn smart_split(text: &str) -> (String, String) {
+    let text = text.trim();
+    let desc = text.chars().take(500).collect::<String>();
+
+    // Find sentence boundary in first 120 chars
+    let boundary = text.char_indices()
+        .take_while(|(i, _)| *i < 120)
+        .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '\n'))
+        .map(|(i, _)| i + 1)
+        .last();
+
+    let title = if let Some(pos) = boundary {
+        text[..pos].trim().to_string()
+    } else if text.len() <= 100 {
+        text.to_string()
+    } else {
+        // Break at last space before 100
+        let cut = text.char_indices()
+            .take_while(|(i, _)| *i < 100)
+            .filter(|(_, c)| c.is_whitespace())
+            .map(|(i, _)| i)
+            .last()
+            .unwrap_or(100);
+        format!("{}\u{2026}", text[..cut].trim())
+    };
+
+    (title, desc)
 }
 
 // --- Reddit ---
@@ -413,41 +484,39 @@ async fn fetch_reddit(client: &Client) -> Result<Vec<TrendItem>> {
         }).collect();
 
         let results = futures::future::join_all(futures).await;
-        for result in results {
-            if let Ok((_sub, data)) = result {
-                if let Some(children) = data["data"]["children"].as_array() {
-                    for child in children {
-                        let post = &child["data"];
-                        let title = post["title"].as_str().unwrap_or_default();
-                        let id = post["id"].as_str().unwrap_or_default();
-                        if title.is_empty() || id.is_empty() { continue; }
+        for (_sub, data) in results.into_iter().flatten() {
+            if let Some(children) = data["data"]["children"].as_array() {
+                for child in children {
+                    let post = &child["data"];
+                    let title = post["title"].as_str().unwrap_or_default();
+                    let id = post["id"].as_str().unwrap_or_default();
+                    if title.is_empty() || id.is_empty() { continue; }
 
-                        let subreddit = post["subreddit"].as_str().unwrap_or_default();
-                        let category = match subreddit.to_lowercase().as_str() {
-                            "technology" | "programming" => "tech",
-                            "worldnews" | "politics" => "politics",
-                            "science" | "space" => "science",
-                            "movies" | "gaming" | "music" | "television" | "entertainment" => "entertainment",
-                            _ => categorize_by_title(title),
-                        };
+                    let subreddit = post["subreddit"].as_str().unwrap_or_default();
+                    let category = match subreddit.to_lowercase().as_str() {
+                        "technology" | "programming" => "tech",
+                        "worldnews" | "politics" => "politics",
+                        "science" | "space" => "science",
+                        "movies" | "gaming" | "music" | "television" | "entertainment" => "entertainment",
+                        _ => categorize_by_title(title),
+                    };
 
-                        items.push(TrendItem {
-                            id: format!("reddit_{id}"),
-                            title: title.to_string(),
-                            description: post["selftext"].as_str()
-                                .filter(|s: &&str| !s.is_empty())
-                                .map(|s: &str| s.chars().take(200).collect()),
-                            url: format!("https://www.reddit.com{}", post["permalink"].as_str().unwrap_or("")),
-                            score: post["ups"].as_i64().unwrap_or(0),
-                            platform: "reddit".to_string(),
-                            category: category.to_string(),
-                            timestamp: post["created_utc"].as_f64().and_then(|t| {
-                                chrono::DateTime::from_timestamp(t as i64, 0)
-                                    .map(|dt| dt.to_rfc3339())
-                            }),
-                            geos: None,
-                        });
-                    }
+                    items.push(TrendItem {
+                        id: format!("reddit_{id}"),
+                        title: title.to_string(),
+                        description: post["selftext"].as_str()
+                            .filter(|s: &&str| !s.is_empty())
+                            .map(|s: &str| s.chars().take(200).collect()),
+                        url: format!("https://www.reddit.com{}", post["permalink"].as_str().unwrap_or("")),
+                        score: post["ups"].as_i64().unwrap_or(0),
+                        platform: "reddit".to_string(),
+                        category: category.to_string(),
+                        timestamp: post["created_utc"].as_f64().and_then(|t| {
+                            chrono::DateTime::from_timestamp(t as i64, 0)
+                                .map(|dt| dt.to_rfc3339())
+                        }),
+                        geos: None,
+                    });
                 }
             }
         }
@@ -481,61 +550,29 @@ async fn fetch_hackernews(client: &Client) -> Result<Vec<TrendItem>> {
         }).collect();
 
         let results = futures::future::join_all(futures).await;
-        for result in results {
-            if let Ok(post) = result {
-                let title = post["title"].as_str().unwrap_or_default();
-                if title.is_empty() { continue; }
-                let id = post["id"].as_i64().unwrap_or(0);
-                items.push(TrendItem {
-                    id: format!("hn_{id}"),
-                    title: title.to_string(),
-                    description: None,
-                    url: post["url"].as_str()
-                        .unwrap_or(&format!("https://news.ycombinator.com/item?id={id}"))
-                        .to_string(),
-                    score: post["score"].as_i64().unwrap_or(0),
-                    platform: "hackernews".to_string(),
-                    category: "tech".to_string(),
-                    timestamp: post["time"].as_i64().and_then(|t| {
-                        chrono::DateTime::from_timestamp(t, 0).map(|dt| dt.to_rfc3339())
-                    }),
-                    geos: None,
-                });
-            }
+        for post in results.into_iter().flatten() {
+            let title = post["title"].as_str().unwrap_or_default();
+            if title.is_empty() { continue; }
+            let id = post["id"].as_i64().unwrap_or(0);
+            items.push(TrendItem {
+                id: format!("hn_{id}"),
+                title: title.to_string(),
+                description: post["text"].as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| strip_html(s).chars().take(300).collect()),
+                url: post["url"].as_str()
+                    .unwrap_or(&format!("https://news.ycombinator.com/item?id={id}"))
+                    .to_string(),
+                score: post["score"].as_i64().unwrap_or(0),
+                platform: "hackernews".to_string(),
+                category: "tech".to_string(),
+                timestamp: post["time"].as_i64().and_then(|t| {
+                    chrono::DateTime::from_timestamp(t, 0).map(|dt| dt.to_rfc3339())
+                }),
+                geos: None,
+            });
         }
     }
-    Ok(items)
-}
-
-// --- GitHub ---
-
-async fn fetch_github(client: &Client) -> Result<Vec<TrendItem>> {
-    let since = (chrono::Utc::now() - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
-    let url = format!("https://api.github.com/search/repositories?q=created:>{since}&sort=stars&order=desc&per_page=20");
-    let res = client.get(&url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .send().await?;
-    let data: serde_json::Value = res.json().await?;
-
-    let items = data["items"].as_array()
-        .map(|repos| {
-            repos.iter().map(|repo| {
-                let name = repo["full_name"].as_str().unwrap_or("");
-                let desc = repo["description"].as_str().unwrap_or("");
-                TrendItem {
-                    id: format!("gh_{}", repo["id"].as_i64().unwrap_or(0)),
-                    title: format!("{name}: {desc}").chars().take(200).collect(),
-                    description: if desc.is_empty() { None } else { Some(desc.to_string()) },
-                    url: repo["html_url"].as_str().unwrap_or("").to_string(),
-                    score: repo["stargazers_count"].as_i64().unwrap_or(0),
-                    platform: "github".to_string(),
-                    category: "tech".to_string(),
-                    timestamp: repo["created_at"].as_str().map(|s| s.to_string()),
-                    geos: None,
-                }
-            }).collect()
-        })
-        .unwrap_or_default();
     Ok(items)
 }
 
@@ -557,14 +594,44 @@ async fn fetch_google(client: &Client) -> Result<Vec<TrendItem>> {
                     None => continue,
                 };
                 let link = extract_xml_tag(entry, "link").unwrap_or_default();
-                let desc = extract_xml_tag(entry, "description").map(|d| strip_html(&d));
+                let mut desc = extract_xml_tag(entry, "description").map(|d| strip_html(&d));
                 let traffic = extract_xml_tag(entry, "ht:approx_traffic").unwrap_or_default();
                 let score = parse_traffic(&traffic);
+
+                // Extract <ht:news_item_title> blocks for richer description
+                let mut news_titles: Vec<String> = Vec::new();
+                let mut search_start = 0;
+                while let Some(pos) = entry[search_start..].find("<ht:news_item>") {
+                    let abs_pos = search_start + pos;
+                    let block_end = entry[abs_pos..].find("</ht:news_item>")
+                        .map(|e| abs_pos + e + "</ht:news_item>".len())
+                        .unwrap_or(entry.len());
+                    let block = &entry[abs_pos..block_end];
+                    if let Some(news_title) = extract_xml_tag(block, "ht:news_item_title") {
+                        news_titles.push(news_title);
+                        if news_titles.len() >= 2 { break; }
+                    }
+                    search_start = abs_pos + "<ht:news_item>".len();
+                    if search_start >= entry.len() { break; }
+                }
+
+                if !news_titles.is_empty() {
+                    let related = news_titles.iter()
+                        .map(|t| format!("'{t}'"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let enriched = format!("Related: {related}");
+                    if desc.as_ref().map(|d| d.is_empty()).unwrap_or(true) {
+                        desc = Some(enriched);
+                    } else {
+                        desc = Some(format!("{} — {}", desc.unwrap(), enriched));
+                    }
+                }
 
                 items.push(TrendItem {
                     id: format!("google_{geo}_{}", title.to_lowercase().replace(' ', "_").chars().take(40).collect::<String>()),
                     title: title.clone(),
-                    description: desc.map(|d| d.chars().take(200).collect()),
+                    description: desc.map(|d| d.chars().take(300).collect()),
                     url: if link.is_empty() { format!("https://trends.google.com/trending?geo={geo}") } else { link },
                     score,
                     platform: "google".to_string(),
@@ -676,28 +743,64 @@ async fn fetch_wikipedia(client: &Client) -> Result<Vec<TrendItem>> {
         None => return Ok(Vec::new()),
     };
 
-    let items: Vec<TrendItem> = articles.iter()
+    let base_items: Vec<(String, String, i64, String)> = articles.iter()
         .filter(|a| {
             let article = a["article"].as_str().unwrap_or("");
             !skip.contains(article) && !article.starts_with("Special:") && !article.starts_with("Wikipedia:")
         })
         .take(30)
         .map(|a| {
-            let article = a["article"].as_str().unwrap_or("");
+            let article = a["article"].as_str().unwrap_or("").to_string();
             let title = article.replace('_', " ");
-            TrendItem {
-                id: format!("wiki_{article}"),
-                title: title.clone(),
-                description: None,
-                url: format!("https://en.wikipedia.org/wiki/{}", urlencoding_simple(article)),
-                score: a["views"].as_i64().unwrap_or(0),
-                platform: "wikipedia".to_string(),
-                category: categorize_by_title(&title).to_string(),
-                timestamp: None,
-                geos: None,
-            }
+            let views = a["views"].as_i64().unwrap_or(0);
+            let url = format!("https://en.wikipedia.org/wiki/{}", urlencoding_simple(&article));
+            (article, title, views, url)
         })
         .collect();
+
+    // Fetch summaries in batches of 10
+    let mut items: Vec<TrendItem> = Vec::new();
+    for chunk in base_items.chunks(10) {
+        let summary_futures: Vec<_> = chunk.iter().map(|(article, title, views, wiki_url)| {
+            let client = client.clone();
+            let article = article.clone();
+            let title = title.clone();
+            let views = *views;
+            let wiki_url = wiki_url.clone();
+            async move {
+                let summary_url = format!(
+                    "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+                    urlencoding_simple(&article)
+                );
+                let description = match client.get(&summary_url).send().await {
+                    Ok(res) if res.status().is_success() => {
+                        match res.json::<serde_json::Value>().await {
+                            Ok(json) => json["extract"].as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.chars().take(300).collect::<String>()),
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+                TrendItem {
+                    id: format!("wiki_{article}"),
+                    title: title.clone(),
+                    description,
+                    url: wiki_url,
+                    score: views,
+                    platform: "wikipedia".to_string(),
+                    category: categorize_by_title(&title).to_string(),
+                    timestamp: None,
+                    geos: None,
+                }
+            }
+        }).collect();
+
+        let chunk_results = futures::future::join_all(summary_futures).await;
+        items.extend(chunk_results);
+    }
+
     Ok(items)
 }
 
@@ -727,7 +830,7 @@ async fn fetch_news(client: &Client) -> Result<Vec<TrendItem>> {
             let res = client.get(&url).send().await?;
             if !res.status().is_success() { return Ok(Vec::new()); }
             let xml = res.text().await?;
-            let items: Vec<TrendItem> = xml.split("<item>").skip(1).take(10).enumerate().map(|(idx, entry)| {
+            let items: Vec<TrendItem> = xml.split("<item>").skip(1).take(10).enumerate().filter_map(|(idx, entry)| {
                 let title = extract_xml_tag(entry, "title").unwrap_or_default();
                 if title.is_empty() { return None; }
                 let desc = extract_xml_tag(entry, "description").map(|d| strip_html(&d));
@@ -746,53 +849,13 @@ async fn fetch_news(client: &Client) -> Result<Vec<TrendItem>> {
                     }),
                     geos: None,
                 })
-            }).flatten().collect();
+            }).collect();
             Ok::<_, anyhow::Error>(items)
         }
     }).collect();
 
     let results: Vec<Result<Vec<TrendItem>>> = futures::future::join_all(futures).await;
     Ok(results.into_iter().filter_map(|r: Result<Vec<TrendItem>>| r.ok()).flatten().collect())
-}
-
-// --- Product Hunt ---
-
-async fn fetch_producthunt(client: &Client) -> Result<Vec<TrendItem>> {
-    let body = serde_json::json!({
-        "query": "{ homefeed(first: 15) { edges { node { id name tagline url votesCount } } } }"
-    });
-
-    let res = client.post("https://www.producthunt.com/frontend/graphql")
-        .json(&body)
-        .send()
-        .await?;
-
-    if !res.status().is_success() { return Ok(Vec::new()); }
-    let data: serde_json::Value = res.json().await?;
-
-    let items = data["data"]["homefeed"]["edges"].as_array()
-        .map(|edges| {
-            edges.iter().map(|edge| {
-                let node = &edge["node"];
-                let name = node["name"].as_str().unwrap_or("");
-                let tagline = node["tagline"].as_str().unwrap_or("");
-                let id = node["id"].as_str().unwrap_or("0");
-                let url_path = node["url"].as_str().unwrap_or("");
-                TrendItem {
-                    id: format!("ph_{id}"),
-                    title: format!("{name}: {tagline}"),
-                    description: if tagline.is_empty() { None } else { Some(tagline.to_string()) },
-                    url: if url_path.is_empty() { "https://www.producthunt.com".to_string() } else { format!("https://www.producthunt.com{url_path}") },
-                    score: node["votesCount"].as_i64().unwrap_or(0),
-                    platform: "producthunt".to_string(),
-                    category: "tech".to_string(),
-                    timestamp: None,
-                    geos: None,
-                }
-            }).collect()
-        })
-        .unwrap_or_default();
-    Ok(items)
 }
 
 // --- Bluesky ---
@@ -825,8 +888,7 @@ async fn fetch_bluesky(client: &Client) -> Result<Vec<TrendItem>> {
         let repost_count = post["repostCount"].as_i64().unwrap_or(0);
         let score = like_count + repost_count;
 
-        let title: String = text.chars().take(100).collect();
-        let description: String = text.chars().take(200).collect();
+        let (title, description) = smart_split(text);
         let bsky_url = format!("https://bsky.app/profile/{did}/post/{rkey}");
         let indexed_at = post["indexedAt"].as_str().map(|s| s.to_string());
 
@@ -859,108 +921,6 @@ fn parse_at_uri(uri: &str) -> Option<(String, String)> {
     Some((did, rkey))
 }
 
-// --- Spotify ---
-
-async fn fetch_spotify(
-    client: &Client,
-    client_id: Option<&str>,
-    client_secret: Option<&str>,
-) -> Result<Vec<TrendItem>> {
-    let (id, secret) = match (client_id, client_secret) {
-        (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => (id, secret),
-        _ => return Ok(Vec::new()),
-    };
-
-    // Step 1: Get access token via Client Credentials flow
-    let token_res = client
-        .post("https://accounts.spotify.com/api/token")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "grant_type=client_credentials&client_id={id}&client_secret={secret}"
-        ))
-        .send()
-        .await?;
-
-    if !token_res.status().is_success() {
-        return Ok(Vec::new());
-    }
-
-    let token_data: serde_json::Value = token_res.json().await?;
-    let access_token = match token_data["access_token"].as_str() {
-        Some(t) => t.to_string(),
-        None => return Ok(Vec::new()),
-    };
-
-    // Step 2: Fetch "Today's Top Hits" playlist tracks
-    let playlist_res = client
-        .get("https://api.spotify.com/v1/playlists/37i9dQZF1DXcBWIGoYBM5M/tracks?limit=20")
-        .header("Authorization", format!("Bearer {access_token}"))
-        .send()
-        .await?;
-
-    if !playlist_res.status().is_success() {
-        return Ok(Vec::new());
-    }
-
-    let playlist_data: serde_json::Value = playlist_res.json().await?;
-
-    let items = playlist_data["items"]
-        .as_array()
-        .map(|tracks| {
-            tracks
-                .iter()
-                .filter_map(|entry| {
-                    let track = &entry["track"];
-                    let track_id = track["id"].as_str().unwrap_or("");
-                    let name = track["name"].as_str().unwrap_or("");
-                    if track_id.is_empty() || name.is_empty() {
-                        return None;
-                    }
-
-                    let artists: Vec<&str> = track["artists"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|a| a["name"].as_str())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let artist_str = artists.join(", ");
-
-                    let album = track["album"]["name"].as_str().unwrap_or("");
-                    let popularity = track["popularity"].as_i64().unwrap_or(0);
-                    let url = track["external_urls"]["spotify"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-
-                    Some(TrendItem {
-                        id: format!("spotify_{track_id}"),
-                        title: format!("{name} \u{2014} {artist_str}"),
-                        description: if album.is_empty() {
-                            None
-                        } else {
-                            Some(format!("from album: {album}"))
-                        },
-                        url: if url.is_empty() {
-                            format!("https://open.spotify.com/track/{track_id}")
-                        } else {
-                            url
-                        },
-                        score: popularity,
-                        platform: "spotify".to_string(),
-                        category: "entertainment".to_string(),
-                        timestamp: None,
-                        geos: None,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(items)
-}
-
 // --- Mastodon ---
 
 #[derive(Debug, Deserialize)]
@@ -989,12 +949,7 @@ async fn fetch_mastodon(client: &Client) -> Result<Vec<TrendItem>> {
         .into_iter()
         .map(|status| {
             let plain = strip_html(&status.content);
-            let title: String = plain.chars().take(100).collect();
-            let description = if plain.len() > 100 {
-                Some(plain.chars().take(300).collect::<String>())
-            } else {
-                None
-            };
+            let (title, description) = smart_split(&plain);
             let score = status.reblogs_count + status.favourites_count;
             let category = categorize_by_title(&title).to_string();
             let timestamp = chrono::DateTime::parse_from_rfc3339(&status.created_at)
@@ -1004,7 +959,7 @@ async fn fetch_mastodon(client: &Client) -> Result<Vec<TrendItem>> {
             TrendItem {
                 id: format!("masto_{}", status.id),
                 title,
-                description,
+                description: Some(description),
                 url: status.url,
                 score,
                 platform: "mastodon".to_string(),
