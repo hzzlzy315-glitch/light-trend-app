@@ -1,6 +1,6 @@
 # Light Trend — Specification
 
-> Version: 2.1 (macOS Native)
+> Version: 3.0 (Neumorphic Dashboard)
 > Date: 2026-03-30
 > Status: Implemented
 
@@ -8,22 +8,22 @@
 
 ## 1. Overview
 
-A macOS menu bar app that aggregates trending topics from 8 platforms into a unified, ranked feed with cross-platform clustering and content enrichment. Click the tray icon to open, click again to hide. Native HudWindow vibrancy, designed for content creators who need to know what the world is talking about.
+A macOS menu bar app that aggregates trending topics from 8 platforms into a unified, ranked feed with cross-platform clustering, content enrichment, and a neumorphic dashboard UI. Click the tray icon to open, click outside to auto-hide. Designed for content creators who need to know what the world is talking about.
 
 ## 2. Goals
 
-- **Content-rich trending**: Not just titles — context, summaries, related news for every topic
-- **Cross-platform intelligence**: Cluster same topics from different platforms, composite scoring
-- **Detective enrichment**: Use data from one platform to fill gaps in another
-- **Zero friction**: Menu bar icon, one click to open/hide
-- **Lightweight**: Native macOS app via Tauri v2
+- **Content-rich trending**: Context, summaries, related news for every topic
+- **Cross-platform intelligence**: Cluster same topics, composite scoring, detective enrichment
+- **Beautiful dashboard**: Neumorphic soft UI with pie charts, score gauges, and spacious layout
+- **Zero friction**: Menu bar icon, auto-hide on focus loss
+- **8 free platforms**: No paid APIs required (YouTube optional)
 
 ## 3. Non-Goals
 
 - No push notifications
-- No user accounts or authentication
-- No cross-platform support (macOS only)
-- No developer-focused platforms (removed GitHub, Product Hunt)
+- No user accounts
+- No cross-platform (macOS only)
+- No developer-focused platforms (removed GitHub, Product Hunt, Spotify)
 
 ---
 
@@ -31,216 +31,162 @@ A macOS menu bar app that aggregates trending topics from 8 platforms into a uni
 
 ### 4.1 Tech Stack
 
-| Layer | Technology | Rationale |
-|-------|-----------|-----------|
-| Desktop framework | Tauri v2 | Native macOS window, tray icon, vibrancy |
-| Frontend | React 19 + TypeScript | Component model, fast dev |
-| Styling | Tailwind CSS v4 | Utility-first |
-| Backend (Rust) | reqwest + futures + tokio | Parallel HTTP fetching for all 8 platforms |
-| Env loading | dotenvy | Loads .env for API keys |
-| Window effects | window-vibrancy | Native macOS HudWindow material |
-| Build tool | Vite 7 | Fast HMR, Tauri-compatible |
+| Layer | Technology |
+|-------|-----------|
+| Desktop | Tauri v2 |
+| Frontend | React 19 + TypeScript + Tailwind CSS v4 |
+| Backend | Rust (reqwest + futures + tokio) |
+| Env | dotenvy (.env loading) |
+| Font | Nunito (Google Fonts) |
+| Build | Vite 7 |
 
-### 4.2 System Diagram
+### 4.2 Platforms (8 total)
 
-```
-                    macOS Menu Bar
-                         │
-                    [Tray Icon] ← click to toggle
-                         │
-┌────────────────────────┴─────────────────────────┐
-│                  Tauri Shell                      │
-│           (HudWindow vibrancy, 16px radius)       │
-│                                                   │
-│  ┌──────────┐     IPC      ┌──────────────────┐  │
-│  │  React   │◄────────────►│    Rust Core     │  │
-│  │  WebView │  (commands)  │                  │  │
-│  │          │              │  platforms.rs    │  │
-│  │  App.tsx │              │  (8 fetchers +   │  │
-│  │          │              │   enrichment)    │  │
-│  └──────────┘              └───────┬──────────┘  │
-│       │                            │              │
-│   localStorage                  .env file         │
-│   (cache)                    (API keys)           │
-└────────────────────────────────────┼──────────────┘
-                     ┌───────────────┼───────────────┐
-                     ▼               ▼               ▼
-              reddit.com      youtube.com       6 more APIs
-              (JSON API)     (Data API v3)    (parallel fetch)
-```
+| Platform | Weight | Content Enrichment |
+|----------|--------|-------------------|
+| YouTube | **1.4** | Title + description + views |
+| Google Trends | **1.2** | Topic + parsed `<ht:news_item>` article titles |
+| Reddit | **1.2** | Title + selftext + upvotes |
+| Hacker News | 0.9 | Title + extracted post text |
+| Wikipedia | **0.9** | Title + page summary API (parallel batch) |
+| Mastodon | 0.6 | Smart sentence-split title + full post |
+| Bluesky | 0.6 | Smart sentence-split title + full post |
+| News RSS | 0.3 | Validation-only (not standalone) |
 
 ---
 
-## 5. Data Pipeline
+## 5. Scoring Algorithm
 
-### 5.1 Platform Sources (8 total)
-
-All platforms fetched **in parallel** via `tokio::join!`. Each has an 8-second timeout.
-
-| Platform | API | Auth | Weight | Content Quality |
-|----------|-----|------|--------|----------------|
-| YouTube | Data API v3 | API key (env) | **1.4** | Title + description + views |
-| Google Trends | RSS feed | None | **1.2** | Topic + related news article titles (enriched) |
-| Reddit | Public JSON | None | **1.2** | Title + selftext + upvotes |
-| Hacker News | Firebase | None | 0.9 | Title + post text (enriched) |
-| Wikipedia | Wikimedia | None | **0.9** | Title + page summary (enriched via API) |
-| Mastodon | Public API | None | 0.6 | Smart sentence-split title + full post |
-| Bluesky | AT Protocol | None | 0.6 | Smart sentence-split title + full post |
-| News RSS | RSS feeds | None | 0.3 | Title + description (validation only) |
-
-**Removed platforms**: GitHub (dev niche), Product Hunt (startup niche), Spotify (needs paid credentials)
-
-### 5.2 Content Enrichment Engine
-
-The "detective" approach — use already-fetched data to fill content gaps:
-
-1. **Google Trends**: RSS contains `<ht:news_item>` blocks with linked news article titles. Parsed and concatenated as description: `"Related: 'Article title 1' | 'Article title 2'"`
-
-2. **Wikipedia**: After fetching top 30 articles, parallel batch requests (3 × 10) to `en.wikipedia.org/api/rest_v1/page/summary/{title}` for 1-2 sentence plain-text summaries.
-
-3. **Mastodon / Bluesky**: Smart sentence-boundary splitting instead of hard 100-char cut. Finds first `.!?\n` within 120 chars for title, full text for description.
-
-4. **Hacker News**: Extracts `text` field from post JSON (for Ask HN, Show HN posts).
-
-5. **Cross-platform backfill**: After clustering, any topic still missing a description gets keyword-matched against ALL fetched items. If another item shares 2+ keywords and has a description ≥20 chars, that description is borrowed.
-
-### 5.3 Scoring Algorithm
-
-#### Step 1: Normalize (per-platform, 0-100)
 ```
-normalizedScore = (item.score / platform_max_score) × 100 × platform_weight
-```
-Capped at 100. Platforms without real engagement metrics (News) use position-based scoring.
-
-#### Step 2: Cluster (cross-platform)
-- Keyword overlap: 3+ matching keywords → merge
-- Trigram similarity (Dice coefficient): 2+ keywords AND similarity > 0.25 → merge
-- Same platform can only appear once per cluster
-
-#### Step 3: Composite Score
-```
-compositeScore = normalizedScore
-               + (mentions - 1) × 20        // cross-platform bonus
-               + recencyBonus               // +15/+10/+5/+0
-               + richnessModifier           // 0/-5/-10
+compositeScore = normalizedScore + (mentions-1)×20 + recencyBonus + richnessModifier
 ```
 
-- **Cross-platform bonus**: +20 per additional platform
-- **Recency**: +15 (<1h), +10 (<6h), +5 (<12h)
-- **Content richness penalty**: description ≥50 chars → 0, <50 chars → -5, none → -10
-
-### 5.4 Categorization
-
-8 categories via shared keyword dictionary:
-All, Technology, Entertainment, Politics, Business, Science, Sports, General
+- Normalized: per-platform 0-100 × weight (capped at 100)
+- Cross-platform: +20 per additional platform
+- Recency: +15 (<1h), +10 (<6h), +5 (<12h)
+- Richness: -10 (no description), -5 (sparse), 0 (rich)
+- Detective backfill: empty descriptions filled by keyword-matching other platforms
 
 ---
 
-## 6. IPC Commands
+## 6. UI Design — Neumorphic Dashboard
 
-| Command | Parameters | Returns |
-|---------|-----------|---------|
-| `fetch_trending` | `youtubeKey?: string` | `TrendingData` |
+### 6.1 Design Language
 
-YouTube API key resolution order:
-1. Frontend parameter (from localStorage)
-2. Environment variable `YOUTUBE_API_KEY`
-3. `.env` file (loaded via dotenvy at startup)
+- **Style**: Neumorphism / Soft UI — elements embossed from surface via dual shadows
+- **Background**: `#dcdee6` (cool blue-gray)
+- **Card surface**: `#ecedf3` (lighter, raised from background)
+- **Inset surface**: `#d4d6de` (darker, pressed into background)
+- **Font**: Nunito (rounded, soft)
+- **Accent**: Purple `#7c5cfc`, Pink/Hot `#e84393`
 
-### Data Schema (camelCase via serde)
+### 6.2 Shadow System
 
-```typescript
-interface TrendingData {
-  items: ClusteredItem[];
-  byCategory: Record<string, ClusteredItem[]>;
-  platformStats: Record<string, { count: number; name: string }>;
-  totalItems: number;
-  fetchedAt: string;
-  elapsed: number;
-}
+| Level | CSS |
+|-------|-----|
+| Raised | `8px 8px 20px #d1d3da, -8px -8px 20px #ffffff` |
+| Small | `4px 4px 12px #d1d3da, -4px -4px 12px #ffffff` |
+| Inset | `inset 2px 2px 6px #d1d3da, inset -2px -2px 6px #ffffff` |
+| Hover | `10px 10px 24px #d1d3da, -10px -10px 24px #ffffff` |
 
-interface ClusteredItem {
-  id: string;
-  title: string;
-  description: string | null;
-  url: string;
-  score: number;
-  platform: string;
-  platforms: string[];
-  platformDetails: { platform: string; score: number; url: string }[];
-  mentions: number;
-  category: string;
-  timestamp: string | null;
-  geos: string[] | null;
-  normalizedScore: number;
-  compositeScore: number;
-}
-```
-
----
-
-## 7. UI Specification
-
-### 7.1 Window Properties
+### 6.3 Window
 
 | Property | Value |
 |----------|-------|
-| Default size | 500 × 780 |
-| Min size | 400 × 520 |
-| Max size | 700 × 960 |
-| Resizable | Yes |
-| Always on top | Yes |
+| Default size | 1340 × 860 |
+| Min size | 900 × 640 |
+| Corner radius | 24px (rounded-3xl) |
 | Decorations | None (custom drag region) |
-| Transparent | Yes (native vibrancy) |
+| Always on top | Yes |
+| Auto-hide | On focus loss |
 | Dock icon | None (Accessory policy) |
+| Vibrancy | None (opaque neumorphic background) |
+| Content padding | 20px top/bottom, 32px left/right |
 
-### 7.2 Design
+### 6.4 Layout (Left-Right Dashboard)
 
-- Semi-transparent dark overlay on native HudWindow vibrancy
-- System font (-apple-system / SF Pro)
-- 15px titles (2-line wrap), 13px descriptions
-- Score colors: rose (>80), blue (>50), muted (below)
-- Colored platform tags per platform identity
-- Top 3 items have amber left border accent
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Light Trend                           Updated 14:32  [Rfr]  │
+├──────────────────────────────────────────────────────────────┤
+│  [Topics 42] [Sources 8] [Top Score 127] [Avg 65] [Raw 371] │
+├──────────────────────────────────────────────────────────────┤
+│  [All] [Tech] [Ent.] [Politics] [Biz] [Sci] [Sports] [Gen]  │
+│                                              [Filter topics] │
+├────────────────────────────────┬─────────────────────────────┤
+│  Topic List (scrollable)       │  Platform Distribution      │
+│                                │  [Donut Pie Chart]          │
+│  1  Topic title here...   ◉85 │                              │
+│  2  Another topic...      ◉72 │  Topic Detail                │
+│  3  Third topic...        ◉68 │  [Score Gauge 72px]          │
+│  ...                           │  Title + timestamp           │
+│                                │  Description                 │
+│                                │  [Platform bars]             │
+│                                │  [Geo tags]                  │
+│                                │  [Links ↗]                   │
+├────────────────────────────────┴─────────────────────────────┤
+│            8 sources  •  371 raw items  •  2.1s fetch        │
+└──────────────────────────────────────────────────────────────┘
+```
 
-### 7.3 Layout
+### 6.5 Category Filter Tabs
 
-Header (drag region) → Filter pills → Search → Topic list → Status bar
+Each category has a permanent color — always visible, not just when active:
 
-### 7.4 Expanded Detail
+| Category | Color | Background |
+|----------|-------|-----------|
+| All | `#7c5cfc` | `#ece7ff` |
+| Tech | `#1a73e8` | `#e8f0fe` |
+| Entertainment | `#e84393` | `#fce4f0` |
+| Politics | `#e17055` | `#ffeae4` |
+| Business | `#00b894` | `#e6fcf5` |
+| Science | `#0984e3` | `#e0f3ff` |
+| Sports | `#fdcb6e` | `#fff8e1` |
+| General | `#6b6b80` | `#f0f0f2` |
 
-- Platform distribution bars (colored)
-- Geo region tags
-- Full description
-- Source links per platform
+Active tab: inset shadow (pressed). Inactive: raised shadow (embossed).
+
+### 6.6 Visualizations
+
+- **Platform Distribution Pie**: SVG donut chart in right panel, showing item count per platform with legend
+- **Score Arc Gauge**: 48px per topic row, 72px in detail panel. 240° arc, color-coded (pink >80, purple >50, gray below)
+
+### 6.7 Interactions
+
+- Click topic row → selects it, shows detail in right panel
+- Click outside app → auto-hide (focus loss detection)
+- Click tray icon → toggle show/hide
+- "/" key → focus search
+- Escape → deselect topic
+- Links open in default browser via Tauri opener plugin
 
 ---
 
-## 8. Environment
+## 7. Environment
 
 | Variable | Required | Source |
 |----------|----------|-------|
 | `YOUTUBE_API_KEY` | Optional | `.env` file or environment variable |
 
-YouTube quota: 10,000 units/day (free). Each refresh = 2 units. Monitor at [Google Cloud Console](https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas).
-
 ---
 
-## 9. File Structure
+## 8. File Structure
 
 ```
 light-trend-app/
 ├── SPEC.md
-├── .env                   # YouTube API key (gitignored)
+├── DESIGN_SPEC.md
+├── .env                    # YouTube API key (gitignored)
 ├── package.json
 ├── vite.config.ts
-├── tsconfig.json
-├── index.html
+├── index.html              # Loads Nunito font
 ├── src/
 │   ├── main.tsx
-│   ├── App.tsx            # Main app (filter, search, cards)
-│   ├── types.ts           # TypeScript interfaces
-│   └── index.css          # Global styles
+│   ├── App.tsx             # Dashboard layout + all components
+│   ├── ScoreGauge.tsx      # SVG arc gauge component
+│   ├── PlatformPie.tsx     # SVG donut chart component
+│   ├── types.ts            # TypeScript interfaces
+│   └── index.css           # Neumorphic design tokens + utilities
 └── src-tauri/
     ├── Cargo.toml
     ├── tauri.conf.json
@@ -248,28 +194,17 @@ light-trend-app/
     ├── icons/
     └── src/
         ├── main.rs
-        ├── lib.rs          # Tauri setup, tray, vibrancy, dotenv
-        └── platforms.rs    # 8 fetchers + enrichment + clustering
+        ├── lib.rs           # Tauri setup, tray, auto-hide, dotenv
+        └── platforms.rs     # 8 fetchers + enrichment + clustering
 ```
 
 ---
 
-## 10. Running
+## 9. Version History
 
-```bash
-# Development
-npm run tauri dev
-
-# Production build
-npm run tauri build
-```
-
----
-
-## 11. Version History
-
-| Version | Date | Changes |
-|---------|------|---------|
-| 1.0 | 2026-03-30 | Web version (Node.js server at localhost:3000) |
-| 2.0 | 2026-03-30 | Tauri v2 macOS native, 11 platforms |
-| 2.1 | 2026-03-30 | Content enrichment engine, removed GitHub/PH/Spotify, 8 platforms, detective cross-fill, richness penalty |
+| Version | Changes |
+|---------|---------|
+| 1.0 | Web version (Node.js server) |
+| 2.0 | Tauri v2 macOS native, 11 platforms |
+| 2.1 | Content enrichment, removed GitHub/PH/Spotify, 8 platforms |
+| **3.0** | **Neumorphic dashboard UI, left-right layout, pie chart, score gauges, Nunito font, auto-hide, colored category tabs, 1340×860 window** |

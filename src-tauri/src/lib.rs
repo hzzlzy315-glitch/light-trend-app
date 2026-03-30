@@ -45,19 +45,16 @@ pub fn run() {
                 .get_webview_window("main")
                 .expect("Window 'main' not found — check tauri.conf.json label");
 
-            #[cfg(target_os = "macos")]
-            {
-                use window_vibrancy::{
-                    apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState,
-                };
-                apply_vibrancy(
-                    &window,
-                    NSVisualEffectMaterial::HudWindow,
-                    Some(NSVisualEffectState::Active),
-                    Some(16.0),
-                )
-                .expect("Failed to apply vibrancy");
-            }
+            // Neumorphic design uses opaque light background — no vibrancy needed
+            // Window is transparent with shadow; CSS provides the light surface
+
+            // Auto-hide when window loses focus (click outside)
+            let window_focus = window.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::Focused(false) = event {
+                    let _ = window_focus.hide();
+                }
+            });
 
             let tray_icon = Image::from_bytes(include_bytes!("../icons/tray-icon.png"))
                 .expect("Failed to load tray icon");
